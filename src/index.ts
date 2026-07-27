@@ -8,6 +8,7 @@ export type AnalyticsSchema<
   Dimension extends string,
   Measure extends string,
 > = {
+  dimensionNormalizers?: Partial<Record<Dimension, (value: string) => string>>;
   dimensions: readonly Dimension[];
   maxGroups?: number;
   measures: readonly Measure[];
@@ -55,6 +56,7 @@ export type AnalyticsSnapshot<
   groups: Array<AnalyticsGroup<Dimension, Measure>>;
   schema: string;
   suppressedGroups: number;
+  suppressedMeasures: number;
 };
 
 export type CohortComparison = {
@@ -62,8 +64,35 @@ export type CohortComparison = {
   baseline: number;
   current: number;
   direction: "higher-is-better" | "lower-is-better";
+  evidence: "insufficient" | "sufficient";
+  minimumSampleSize: number;
   regression: boolean;
   relativeChange: number | null;
+  sampleSizes: { baseline: number | null; current: number | null };
+};
+
+const EMAIL_VALUE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const IP_VALUE = /^(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f]*:[0-9a-f:]+)$/i;
+const UUID_SEGMENT =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const INTEGER_SEGMENT = /^\d+$/;
+
+export const normalizeRouteTemplate = (value: string): string => {
+  const [path = ""] = value.split(/[?#]/, 1);
+
+  return (
+    path
+      .split("/")
+      .map((segment) => {
+        if (EMAIL_VALUE.test(segment)) return ":redacted";
+        if (IP_VALUE.test(segment)) return ":redacted";
+        if (UUID_SEGMENT.test(segment)) return ":id";
+        if (INTEGER_SEGMENT.test(segment)) return ":id";
+
+        return segment;
+      })
+      .join("/") || "/"
+  );
 };
 
 const assertUnique = (values: readonly string[], label: string) => {
@@ -151,6 +180,10 @@ const validateObservation = <Dimension extends string, Measure extends string>(
       value.length > MAX_DIMENSION_VALUE_LENGTH
     )
       throw new Error(`Analytics dimension value is invalid: ${name}`);
+    if (EMAIL_VALUE.test(value) || IP_VALUE.test(value))
+      throw new Error(
+        `Sensitive analytics dimension value is forbidden: ${name}`,
+      );
   }
   const measures = new Set<string>(schema.measures);
   for (const [name, value] of Object.entries(observation.measures)) {
@@ -189,10 +222,12 @@ export const aggregateAnalytics = <
     if (query.start !== undefined && observation.at < query.start) continue;
     if (query.end !== undefined && observation.at >= query.end) continue;
     const dimensions = Object.fromEntries(
-      query.groupBy.map((name) => [
-        name,
-        observation.dimensions[name] ?? "unknown",
-      ]),
+      query.groupBy.map((name) => {
+        const value = observation.dimensions[name] ?? "unknown";
+        const normalize = schema.dimensionNormalizers?.[name];
+
+        return [name, normalize ? normalize(value) : value];
+      }),
     ) as Partial<Record<Dimension, string>>;
     const key = JSON.stringify(dimensions);
     let group = groups.get(key);
@@ -215,28 +250,38 @@ export const aggregateAnalytics = <
   const visible = [...groups.values()].filter(
     (group) => group.observations >= minimum,
   );
+  let suppressedMeasures = 0;
 
   return {
     accepted,
     groups: visible.map((group) => ({
       dimensions: group.dimensions,
       measures: Object.fromEntries(
-        [...group.measures].map(([name, values]) => [
-          name,
-          aggregateMeasure(values, quantiles),
-        ]),
+        [...group.measures].flatMap(([name, values]) => {
+          if (values.length < minimum) {
+            suppressedMeasures += 1;
+
+            return [];
+          }
+
+          return [[name, aggregateMeasure(values, quantiles)]];
+        }),
       ) as Partial<Record<Measure, MeasureAggregate>>,
       observations: group.observations,
     })),
     schema: schema.name,
     suppressedGroups: groups.size - visible.length,
+    suppressedMeasures,
   };
 };
 
 export const compareCohorts = (input: {
   baseline: number;
+  baselineSampleSize?: number;
   current: number;
+  currentSampleSize?: number;
   direction: CohortComparison["direction"];
+  minimumSampleSize?: number;
   regressionThreshold?: number;
 }): CohortComparison => {
   if (!Number.isFinite(input.baseline) || !Number.isFinite(input.current))
@@ -245,6 +290,18 @@ export const compareCohorts = (input: {
   const relativeChange =
     input.baseline === 0 ? null : absoluteChange / Math.abs(input.baseline);
   const threshold = input.regressionThreshold ?? 0;
+  const minimumSampleSize = input.minimumSampleSize ?? 20;
+  const sampleSizes = {
+    baseline: input.baselineSampleSize ?? null,
+    current: input.currentSampleSize ?? null,
+  };
+  const evidence =
+    sampleSizes.baseline !== null &&
+    sampleSizes.current !== null &&
+    sampleSizes.baseline >= minimumSampleSize &&
+    sampleSizes.current >= minimumSampleSize
+      ? "sufficient"
+      : "insufficient";
   const harmfulChange =
     input.direction === "lower-is-better" ? absoluteChange : -absoluteChange;
 
@@ -253,9 +310,13 @@ export const compareCohorts = (input: {
     baseline: input.baseline,
     current: input.current,
     direction: input.direction,
+    evidence,
+    minimumSampleSize,
     regression:
+      evidence === "sufficient" &&
       harmfulChange > 0 &&
       (relativeChange === null || Math.abs(relativeChange) >= threshold),
     relativeChange,
+    sampleSizes,
   };
 };

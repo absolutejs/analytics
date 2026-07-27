@@ -1,6 +1,6 @@
 {
   "name": "@absolutejs/analytics",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Typed, tenant-fenced, privacy-thresholded product and operational analytics primitives for AbsoluteJS.",
   "repository": {
     "type": "git",
