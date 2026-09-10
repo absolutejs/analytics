@@ -35,10 +35,10 @@
     "typecheck": "tsc --noEmit",
     "check:package": "bun run format && bun run typecheck && bun run test && bun run build && absolute-changelog check",
     "release": "bun run check:package && bun publish",
-    "prepublishOnly": "absolute-changelog check"
+    "prepublishOnly": "bun run check:package"
   },
   "devDependencies": {
-    "@absolutejs/changelog": "^0.5.1",
+    "@absolutejs/changelog": "^0.6.0",
     "@types/bun": "^1.3.14",
     "prettier": "^3.8.3",
     "typescript": "^5.9.3"
